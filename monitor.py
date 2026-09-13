@@ -1,27 +1,40 @@
 import html
 import hashlib
 import json
-import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urljoin, urlparse, urlunparse
 
+import requests
+import pytesseract
+from PIL import Image
+from io import BytesIO
 from playwright.sync_api import sync_playwright
 
 
-TARGET_URL = "https://www.rnz.de/anzeigen-immobilien_rubrik,4240.html"
+TARGET_URL = (
+    "https://www.rnz.de/"
+    "anzeigen-immobilien_rubrik,4240.html"
+)
 
 STATE_FILE = Path("state/listings.json")
 FEED_FILE = Path("feed.xml")
 
-FEED_TITLE = "RNZ Immobilienanzeigen"
-FEED_DESCRIPTION = "Neue Immobilienanzeigen auf RNZ"
-FEED_LINK = TARGET_URL
+MAX_ITEMS = 100
 
 
 def clean_text(text):
-    return re.sub(r"\s+", " ", text or "").strip()
+    text = text or ""
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def xml_escape(text):
+    return html.escape(
+        str(text or ""),
+        quote=True,
+    )
 
 
 def canonical_url(url):
@@ -39,106 +52,123 @@ def canonical_url(url):
     )
 
 
-def make_id(url):
-    return hashlib.sha256(
-        canonical_url(url).encode("utf-8")
-    ).hexdigest()
-
-
 def load_state():
     if not STATE_FILE.exists():
         return {}
 
     try:
         return json.loads(
-            STATE_FILE.read_text(encoding="utf-8")
+            STATE_FILE.read_text(
+                encoding="utf-8"
+            )
         )
     except Exception:
         return {}
 
 
 def save_state(state):
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     STATE_FILE.write_text(
         json.dumps(
             state,
             ensure_ascii=False,
             indent=2,
-        )
-        + "\n",
+        ) + "\n",
         encoding="utf-8",
     )
 
 
-def xml_escape(value):
-    return html.escape(
-        str(value or ""),
-        quote=True,
+def get_image_id(image_url):
+    """
+    RNZ image URLs look approximately like:
+
+    2612265_1_advertbig_....jpg
+
+    The numeric ID is much more useful as a stable
+    listing identifier than a hash of the surrounding HTML.
+    """
+
+    filename = Path(
+        urlparse(image_url).path
+    ).name
+
+    match = re.match(
+        r"(\d+)_\d+_advertbig",
+        filename,
+        re.IGNORECASE,
+    )
+
+    if match:
+        return match.group(1)
+
+    return hashlib.sha256(
+        image_url.encode("utf-8")
+    ).hexdigest()[:24]
+
+
+def get_image_url(src):
+    return urljoin(
+        TARGET_URL,
+        src,
     )
 
 
-def extract_container_text(anchor):
-    return anchor.evaluate(
-        """
-        (a) => {
-            const selectors = [
-                "article",
-                "li",
-                "[class*='card']",
-                "[class*='item']",
-                "[class*='result']",
-                "[class*='anzeige']"
-            ];
+def ocr_image(image_url):
+    """
+    OCR the advertisement image.
 
-            for (const selector of selectors) {
-                const el = a.closest(selector);
+    German + English are used because property ads
+    can contain abbreviations and English terms.
+    """
 
-                if (el) {
-                    const text = el.innerText || "";
+    try:
+        response = requests.get(
+            image_url,
+            timeout=30,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 "
+                    "(compatible; RNZ-RSS-Monitor/1.0)"
+                )
+            },
+        )
 
-                    if (text.trim().length >= 20) {
-                        return text;
-                    }
-                }
-            }
+        response.raise_for_status()
 
-            let el = a;
+        image = Image.open(
+            BytesIO(response.content)
+        )
 
-            for (let i = 0; i < 6 && el; i++) {
-                el = el.parentElement;
+        # Upscale small advertisements before OCR.
+        width, height = image.size
 
-                if (!el) break;
+        if width < 1000:
+            scale = 1000 / width
+            image = image.resize(
+                (
+                    int(width * scale),
+                    int(height * scale),
+                )
+            )
 
-                const text = el.innerText || "";
+        text = pytesseract.image_to_string(
+            image,
+            lang="deu+eng",
+            config="--psm 6",
+        )
 
-                if (text.trim().length >= 20) {
-                    return text;
-                }
-            }
+        return clean_text(text)
 
-            return a.innerText || "";
-        }
-        """
-    )
+    except Exception as exc:
+        print(
+            f"OCR failed for {image_url}: {exc}"
+        )
 
-
-def extract_title(anchor, text):
-    title = clean_text(anchor.inner_text())
-
-    if len(title) >= 5:
-        return title
-
-    lines = [
-        clean_text(line)
-        for line in text.splitlines()
-        if clean_text(line)
-    ]
-
-    if lines:
-        return lines[0]
-
-    return "Neue Immobilienanzeige"
+        return ""
 
 
 def extract_price(text):
@@ -155,7 +185,9 @@ def extract_price(text):
         )
 
         if match:
-            return clean_text(match.group(0))
+            return clean_text(
+                match.group(0)
+            )
 
     return ""
 
@@ -174,7 +206,9 @@ def extract_size(text):
         )
 
         if match:
-            return clean_text(match.group(0))
+            return clean_text(
+                match.group(0)
+            )
 
     return ""
 
@@ -193,175 +227,226 @@ def extract_rooms(text):
         )
 
         if match:
-            return clean_text(match.group(0))
+            return clean_text(
+                match.group(0)
+            )
 
     return ""
 
 
-def make_rss_title(title, text):
-    price = extract_price(text)
-    size = extract_size(text)
-    rooms = extract_rooms(text)
+def make_title(ocr_text, image_id):
+    """
+    Build a useful Feedly title from OCR.
 
-    extras = []
+    We deliberately don't pretend that OCR is perfect.
+    If we cannot confidently extract structured values,
+    we use the first useful OCR phrase instead.
+    """
 
-    if price:
-        extras.append(price)
+    price = extract_price(ocr_text)
+    size = extract_size(ocr_text)
+    rooms = extract_rooms(ocr_text)
 
-    if size:
-        extras.append(size)
+    parts = []
 
     if rooms:
-        extras.append(rooms)
+        parts.append(rooms)
 
-    if extras:
-        return f"{title} – {' · '.join(extras)}"
+    if size:
+        parts.append(size)
 
-    return title
+    if price:
+        parts.append(price)
+
+    # Look for a likely location.
+    location = ""
+
+    known_places = [
+        "Heidelberg",
+        "Mannheim",
+        "Schwetzingen",
+        "Leimen",
+        "Eppelheim",
+        "Dossenheim",
+        "Neckargemünd",
+        "Wiesloch",
+        "Walldorf",
+        "Weinheim",
+        "Ladenburg",
+        "Sandhausen",
+        "Nußloch",
+    ]
+
+    for place in known_places:
+        if re.search(
+            rf"\b{re.escape(place)}\b",
+            ocr_text,
+            re.IGNORECASE,
+        ):
+            location = place
+            break
+
+    if location:
+        parts.insert(0, location)
+
+    if parts:
+        return "🏠 " + " · ".join(parts)
+
+    # Fallback: use first useful OCR words.
+    words = ocr_text.split()
+
+    if words:
+        fallback = " ".join(words[:12])
+
+        return (
+            f"🏠 {fallback} "
+            f"(RNZ #{image_id})"
+        )
+
+    return (
+        f"🏠 Neue Immobilienanzeige "
+        f"(RNZ #{image_id})"
+    )
 
 
-def make_description(title, text, url):
+def make_description(
+    ocr_text,
+    image_url,
+    listing_url,
+):
+    safe_text = xml_escape(
+        ocr_text
+    )
+
     return f"""
-<p><strong>{xml_escape(title)}</strong></p>
-
-<p>{xml_escape(text)}</p>
+<p>
+  <img
+    src="{xml_escape(image_url)}"
+    alt="RNZ Immobilienanzeige"
+    style="max-width:100%;height:auto;"
+  >
+</p>
 
 <p>
-<a href="{xml_escape(url)}">
-Immobilienanzeige bei RNZ öffnen
-</a>
+  <strong>OCR text:</strong>
+</p>
+
+<p>
+  {safe_text}
+</p>
+
+<p>
+  <a href="{xml_escape(listing_url)}">
+    Original RNZ Immobilienanzeige öffnen
+  </a>
 </p>
 """.strip()
 
 
-def extract_listings(page):
-    anchors = page.locator(
-        "a[href*='anzeige-detail']"
+def extract_listing_url(img):
+    """
+    Try to find the RNZ page associated with the image.
+    """
+
+    return img.evaluate(
+        """
+        (img) => {
+            const anchor = img.closest("a");
+
+            if (anchor && anchor.href) {
+                return anchor.href;
+            }
+
+            return "";
+        }
+        """
+    )
+
+
+def extract_image_listings(page):
+    """
+    Find RNZ Immobilien advertisement images.
+
+    We specifically target images containing 'advertbig'
+    rather than arbitrary images on the page.
+    """
+
+    images = page.locator(
+        "img[src*='advertbig']"
+    )
+
+    print(
+        f"Found {images.count()} advertisement images."
     )
 
     listings = {}
 
-    for i in range(anchors.count()):
-        anchor = anchors.nth(i)
+    for i in range(images.count()):
+        img = images.nth(i)
 
         try:
-            href = anchor.get_attribute("href")
+            src = img.get_attribute("src")
 
-            if not href:
+            if not src:
                 continue
 
-            url = canonical_url(
-                urljoin(TARGET_URL, href)
+            image_url = get_image_url(src)
+
+            image_id = get_image_id(
+                image_url
             )
 
-            parsed = urlparse(url)
-
-            # Only accept links on rnz.de.
-            if parsed.netloc and parsed.netloc != "www.rnz.de":
-                continue
-
-            text = clean_text(
-                extract_container_text(anchor)
+            listing_url = (
+                extract_listing_url(img)
             )
 
-            if len(text) < 10:
-                continue
+            if not listing_url:
+                listing_url = TARGET_URL
 
-            title = extract_title(
-                anchor,
-                text,
+            listing_url = canonical_url(
+                listing_url
             )
 
-            item_id = make_id(url)
+            print(
+                f"OCR #{image_id}: "
+                f"{image_url}"
+            )
 
-            listings[item_id] = {
-                "id": item_id,
+            ocr_text = ocr_image(
+                image_url
+            )
+
+            title = make_title(
+                ocr_text,
+                image_id,
+            )
+
+            listings[image_id] = {
+                "id": image_id,
                 "title": title,
-                "rss_title": make_rss_title(
-                    title,
-                    text,
+                "image_url": image_url,
+                "listing_url": listing_url,
+                "ocr": ocr_text,
+                "first_seen": (
+                    datetime.now(
+                        timezone.utc
+                    ).isoformat()
                 ),
-                "url": url,
-                "description": make_description(
-                    title,
-                    text,
-                    url,
-                ),
-                "text": text,
-                "first_seen": datetime.now(
-                    timezone.utc
-                ).isoformat(),
             }
 
         except Exception as exc:
             print(
-                f"Could not process listing {i}: {exc}"
+                f"Could not process image "
+                f"{i}: {exc}"
             )
 
     return listings
 
 
-def generate_feed(listings):
-    # Newest first.
-    items = sorted(
-        listings.values(),
-        key=lambda x: x.get(
-            "first_seen",
-            "",
-        ),
-        reverse=True,
-    )
-
-    now = datetime.now(
-        timezone.utc
-    ).strftime(
-        "%a, %d %b %Y %H:%M:%S GMT"
-    )
-
-    rss_items = []
-
-    # Keep the feed reasonably sized.
-    for listing in items[:100]:
-        rss_items.append(
-            f"""
-    <item>
-      <title>{xml_escape(listing["rss_title"])}</title>
-      <link>{xml_escape(listing["url"])}</link>
-      <guid isPermaLink="true">{xml_escape(listing["url"])}</guid>
-      <pubDate>{datetime_to_rfc822(listing["first_seen"])}</pubDate>
-      <description><![CDATA[
-        {listing["description"]}
-      ]]></description>
-    </item>
-"""
-        )
-
-    feed = f"""<?xml version="1.0" encoding="UTF-8"?>
-<rss version="2.0">
-  <channel>
-    <title>{xml_escape(FEED_TITLE)}</title>
-    <link>{xml_escape(FEED_LINK)}</link>
-    <description>{xml_escape(FEED_DESCRIPTION)}</description>
-    <language>de-DE</language>
-    <lastBuildDate>{now}</lastBuildDate>
-    <ttl>10</ttl>
-    <generator>RNZ Immobilien RSS Monitor</generator>
-
-    {"".join(rss_items)}
-  </channel>
-</rss>
-"""
-
-    FEED_FILE.write_text(
-        feed,
-        encoding="utf-8",
-    )
-
-
-def datetime_to_rfc822(value):
+def rfc822(iso_date):
     try:
         dt = datetime.fromisoformat(
-            value.replace(
+            iso_date.replace(
                 "Z",
                 "+00:00",
             )
@@ -379,14 +464,109 @@ def datetime_to_rfc822(value):
         )
 
 
+def generate_feed(listings):
+    items = sorted(
+        listings.values(),
+        key=lambda item: item.get(
+            "first_seen",
+            "",
+        ),
+        reverse=True,
+    )
+
+    rss_items = []
+
+    for item in items[:MAX_ITEMS]:
+        description = make_description(
+            item["ocr"],
+            item["image_url"],
+            item["listing_url"],
+        )
+
+        rss_items.append(
+            f"""
+    <item>
+      <title>
+        {xml_escape(item["title"])}
+      </title>
+
+      <link>
+        {xml_escape(item["listing_url"])}
+      </link>
+
+      <guid isPermaLink="false">
+        rnz-immobilien-{xml_escape(item["id"])}
+      </guid>
+
+      <pubDate>
+        {rfc822(item["first_seen"])}
+      </pubDate>
+
+      <description><![CDATA[
+        {description}
+      ]]></description>
+
+      <enclosure
+        url="{xml_escape(item["image_url"])}"
+        type="image/jpeg"
+      />
+    </item>
+"""
+        )
+
+    now = datetime.now(
+        timezone.utc
+    ).strftime(
+        "%a, %d %b %Y %H:%M:%S GMT"
+    )
+
+    feed = f"""<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+
+    <title>RNZ Immobilien</title>
+
+    <link>
+      {xml_escape(TARGET_URL)}
+    </link>
+
+    <description>
+      Neue Immobilienanzeigen der Rhein-Neckar-Zeitung
+    </description>
+
+    <language>de-DE</language>
+
+    <lastBuildDate>
+      {now}
+    </lastBuildDate>
+
+    <ttl>10</ttl>
+
+    <generator>
+      RNZ Immobilien RSS Monitor
+    </generator>
+
+    {"".join(rss_items)}
+
+  </channel>
+</rss>
+"""
+
+    FEED_FILE.write_text(
+        feed,
+        encoding="utf-8",
+    )
+
+
 def main():
     previous = load_state()
 
     print(
-        f"Checking {TARGET_URL}"
+        f"Checking RNZ: {TARGET_URL}"
     )
 
     with sync_playwright() as p:
+
         browser = p.chromium.launch(
             headless=True
         )
@@ -396,10 +576,11 @@ def main():
             timezone_id="Europe/Berlin",
             viewport={
                 "width": 1440,
-                "height": 1000,
+                "height": 1200,
             },
             user_agent=(
-                "Mozilla/5.0 (X11; Linux x86_64) "
+                "Mozilla/5.0 "
+                "(X11; Linux x86_64) "
                 "AppleWebKit/537.36 "
                 "(KHTML, like Gecko) "
                 "Chrome/140.0 Safari/537.36"
@@ -421,36 +602,48 @@ def main():
 
         if not response.ok:
             raise RuntimeError(
-                f"RNZ returned HTTP {response.status}"
+                f"RNZ returned HTTP "
+                f"{response.status}"
             )
 
-        # Allow dynamic content to load.
-        page.wait_for_timeout(7000)
+        # Wait for lazy-loaded content.
+        page.wait_for_timeout(
+            7000
+        )
 
-        # Trigger lazy-loaded listings.
-        for _ in range(8):
-            page.mouse.wheel(0, 1500)
-            page.wait_for_timeout(500)
+        # Scroll through the page so
+        # lazy-loaded advertisement images appear.
+        for _ in range(10):
+            page.mouse.wheel(
+                0,
+                1500,
+            )
+            page.wait_for_timeout(
+                600
+            )
 
-        current = extract_listings(page)
+        current = extract_image_listings(
+            page
+        )
 
         browser.close()
 
-    print(
-        f"Found {len(current)} listings."
-    )
-
     if not current:
         raise RuntimeError(
-            "No listings detected. "
-            "The state and feed were NOT changed."
+            "No advertbig images were found. "
+            "The RNZ page structure may have changed. "
+            "Existing state was NOT overwritten."
         )
 
-    # First successful run:
-    # establish baseline.
+    print(
+        f"Detected {len(current)} listings."
+    )
+
+    # First run = baseline.
     if not previous:
+
         print(
-            "Creating initial baseline."
+            "Initial run: establishing baseline."
         )
 
         save_state(current)
@@ -458,14 +651,17 @@ def main():
 
         return
 
-    # Preserve first_seen for existing listings.
-    for item_id, listing in current.items():
+    # Preserve original first_seen.
+    for item_id, item in current.items():
+
         if item_id in previous:
-            listing["first_seen"] = previous[
-                item_id
-            ].get(
-                "first_seen",
-                listing["first_seen"],
+
+            item["first_seen"] = (
+                previous[item_id]
+                .get(
+                    "first_seen",
+                    item["first_seen"],
+                )
             )
 
     new_ids = (
@@ -474,24 +670,18 @@ def main():
     )
 
     print(
-        f"New listings: {len(new_ids)}"
+        f"New advertisements: "
+        f"{len(new_ids)}"
     )
 
     for item_id in new_ids:
         print(
             "NEW:",
-            current[item_id]["rss_title"],
-        )
-        print(
-            current[item_id]["url"]
+            current[item_id]["title"],
         )
 
     save_state(current)
     generate_feed(current)
-
-    print(
-        f"RSS feed generated: {FEED_FILE}"
-    )
 
 
 if __name__ == "__main__":
