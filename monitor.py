@@ -1,31 +1,30 @@
+import html
 import hashlib
 import json
 import os
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urljoin, urlparse, urlunparse
 
 from playwright.sync_api import sync_playwright
 
 
-TARGET_URL = os.environ.get(
-    "TARGET_URL",
-    "https://www.rnz.de/anzeigen-immobilien_rubrik,4240.html",
-)
+TARGET_URL = "https://www.rnz.de/anzeigen-immobilien_rubrik,4240.html"
 
 STATE_FILE = Path("state/listings.json")
+FEED_FILE = Path("feed.xml")
+
+FEED_TITLE = "RNZ Immobilienanzeigen"
+FEED_DESCRIPTION = "Neue Immobilienanzeigen auf RNZ"
+FEED_LINK = TARGET_URL
 
 
-def clean_text(text: str) -> str:
-    text = re.sub(r"\s+", " ", text or "")
-    return text.strip()
+def clean_text(text):
+    return re.sub(r"\s+", " ", text or "").strip()
 
 
-def canonical_url(url: str) -> str:
-    """
-    Remove fragments and tracking parameters so the same listing
-    doesn't appear as a new listing because of a changing URL.
-    """
+def canonical_url(url):
     parsed = urlparse(url)
 
     return urlunparse(
@@ -40,13 +39,13 @@ def canonical_url(url: str) -> str:
     )
 
 
-def listing_id(url: str) -> str:
+def make_id(url):
     return hashlib.sha256(
         canonical_url(url).encode("utf-8")
     ).hexdigest()
 
 
-def load_previous_listings():
+def load_state():
     if not STATE_FILE.exists():
         return {}
 
@@ -58,12 +57,12 @@ def load_previous_listings():
         return {}
 
 
-def save_listings(listings):
+def save_state(state):
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
 
     STATE_FILE.write_text(
         json.dumps(
-            listings,
+            state,
             ensure_ascii=False,
             indent=2,
         )
@@ -72,15 +71,14 @@ def save_listings(listings):
     )
 
 
-def extract_listing_text(anchor):
-    """
-    Try to find the container belonging to the listing.
+def xml_escape(value):
+    return html.escape(
+        str(value or ""),
+        quote=True,
+    )
 
-    RNZ can change CSS class names, so this deliberately uses
-    several structural fallbacks rather than relying on one
-    fragile CSS selector.
-    """
 
+def extract_container_text(anchor):
     return anchor.evaluate(
         """
         (a) => {
@@ -107,7 +105,7 @@ def extract_listing_text(anchor):
 
             let el = a;
 
-            for (let i = 0; i < 5 && el; i++) {
+            for (let i = 0; i < 6 && el; i++) {
                 el = el.parentElement;
 
                 if (!el) break;
@@ -125,16 +123,16 @@ def extract_listing_text(anchor):
     )
 
 
-def extract_title(anchor, container_text):
+def extract_title(anchor, text):
     title = clean_text(anchor.inner_text())
 
-    if title and len(title) >= 5:
+    if len(title) >= 5:
         return title
 
     lines = [
-        clean_text(x)
-        for x in container_text.splitlines()
-        if clean_text(x)
+        clean_text(line)
+        for line in text.splitlines()
+        if clean_text(line)
     ]
 
     if lines:
@@ -143,25 +141,112 @@ def extract_title(anchor, container_text):
     return "Neue Immobilienanzeige"
 
 
+def extract_price(text):
+    patterns = [
+        r"\b\d{1,3}(?:[.\s]\d{3})*(?:,\d{2})?\s*€",
+        r"€\s*\d{1,3}(?:[.\s]\d{3})*(?:,\d{2})?",
+    ]
+
+    for pattern in patterns:
+        match = re.search(
+            pattern,
+            text,
+            re.IGNORECASE,
+        )
+
+        if match:
+            return clean_text(match.group(0))
+
+    return ""
+
+
+def extract_size(text):
+    patterns = [
+        r"\b\d+(?:[.,]\d+)?\s*m²\b",
+        r"\b\d+(?:[.,]\d+)?\s*qm\b",
+    ]
+
+    for pattern in patterns:
+        match = re.search(
+            pattern,
+            text,
+            re.IGNORECASE,
+        )
+
+        if match:
+            return clean_text(match.group(0))
+
+    return ""
+
+
+def extract_rooms(text):
+    patterns = [
+        r"\b\d+(?:[.,]\d+)?\s*[- ]?Zimmer\b",
+        r"\b\d+(?:[.,]\d+)?\s*Zi\.\b",
+    ]
+
+    for pattern in patterns:
+        match = re.search(
+            pattern,
+            text,
+            re.IGNORECASE,
+        )
+
+        if match:
+            return clean_text(match.group(0))
+
+    return ""
+
+
+def make_rss_title(title, text):
+    price = extract_price(text)
+    size = extract_size(text)
+    rooms = extract_rooms(text)
+
+    extras = []
+
+    if price:
+        extras.append(price)
+
+    if size:
+        extras.append(size)
+
+    if rooms:
+        extras.append(rooms)
+
+    if extras:
+        return f"{title} – {' · '.join(extras)}"
+
+    return title
+
+
+def make_description(title, text, url):
+    return f"""
+<p><strong>{xml_escape(title)}</strong></p>
+
+<p>{xml_escape(text)}</p>
+
+<p>
+<a href="{xml_escape(url)}">
+Immobilienanzeige bei RNZ öffnen
+</a>
+</p>
+""".strip()
+
+
 def extract_listings(page):
-    """
-    Find links pointing to RNZ advertisement detail pages.
-
-    The exact listing-card HTML can change, so we identify
-    advertisements primarily by their detail URL.
-    """
-
-    candidates = page.locator(
+    anchors = page.locator(
         "a[href*='anzeige-detail']"
     )
 
     listings = {}
 
-    for i in range(candidates.count()):
-        anchor = candidates.nth(i)
+    for i in range(anchors.count()):
+        anchor = anchors.nth(i)
 
         try:
             href = anchor.get_attribute("href")
+
             if not href:
                 continue
 
@@ -171,28 +256,41 @@ def extract_listings(page):
 
             parsed = urlparse(url)
 
-            if parsed.netloc and parsed.netloc != urlparse(
-                TARGET_URL
-            ).netloc:
+            # Only accept links on rnz.de.
+            if parsed.netloc and parsed.netloc != "www.rnz.de":
                 continue
 
-            container_text = extract_listing_text(anchor)
-            container_text = clean_text(container_text)
+            text = clean_text(
+                extract_container_text(anchor)
+            )
 
-            if len(container_text) < 10:
+            if len(text) < 10:
                 continue
 
             title = extract_title(
                 anchor,
-                container_text,
+                text,
             )
 
-            item_id = listing_id(url)
+            item_id = make_id(url)
 
             listings[item_id] = {
-                "url": url,
+                "id": item_id,
                 "title": title,
-                "text": container_text,
+                "rss_title": make_rss_title(
+                    title,
+                    text,
+                ),
+                "url": url,
+                "description": make_description(
+                    title,
+                    text,
+                    url,
+                ),
+                "text": text,
+                "first_seen": datetime.now(
+                    timezone.utc
+                ).isoformat(),
             }
 
         except Exception as exc:
@@ -203,10 +301,90 @@ def extract_listings(page):
     return listings
 
 
-def main():
-    print(f"Checking: {TARGET_URL}")
+def generate_feed(listings):
+    # Newest first.
+    items = sorted(
+        listings.values(),
+        key=lambda x: x.get(
+            "first_seen",
+            "",
+        ),
+        reverse=True,
+    )
 
-    previous = load_previous_listings()
+    now = datetime.now(
+        timezone.utc
+    ).strftime(
+        "%a, %d %b %Y %H:%M:%S GMT"
+    )
+
+    rss_items = []
+
+    # Keep the feed reasonably sized.
+    for listing in items[:100]:
+        rss_items.append(
+            f"""
+    <item>
+      <title>{xml_escape(listing["rss_title"])}</title>
+      <link>{xml_escape(listing["url"])}</link>
+      <guid isPermaLink="true">{xml_escape(listing["url"])}</guid>
+      <pubDate>{datetime_to_rfc822(listing["first_seen"])}</pubDate>
+      <description><![CDATA[
+        {listing["description"]}
+      ]]></description>
+    </item>
+"""
+        )
+
+    feed = f"""<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>{xml_escape(FEED_TITLE)}</title>
+    <link>{xml_escape(FEED_LINK)}</link>
+    <description>{xml_escape(FEED_DESCRIPTION)}</description>
+    <language>de-DE</language>
+    <lastBuildDate>{now}</lastBuildDate>
+    <ttl>10</ttl>
+    <generator>RNZ Immobilien RSS Monitor</generator>
+
+    {"".join(rss_items)}
+  </channel>
+</rss>
+"""
+
+    FEED_FILE.write_text(
+        feed,
+        encoding="utf-8",
+    )
+
+
+def datetime_to_rfc822(value):
+    try:
+        dt = datetime.fromisoformat(
+            value.replace(
+                "Z",
+                "+00:00",
+            )
+        )
+
+        return dt.strftime(
+            "%a, %d %b %Y %H:%M:%S GMT"
+        )
+
+    except Exception:
+        return datetime.now(
+            timezone.utc
+        ).strftime(
+            "%a, %d %b %Y %H:%M:%S GMT"
+        )
+
+
+def main():
+    previous = load_state()
+
+    print(
+        f"Checking {TARGET_URL}"
+    )
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -238,7 +416,7 @@ def main():
 
         if response is None:
             raise RuntimeError(
-                "No response received from RNZ."
+                "RNZ returned no response."
             )
 
         if not response.ok:
@@ -246,83 +424,74 @@ def main():
                 f"RNZ returned HTTP {response.status}"
             )
 
-        # Allow dynamically loaded advertisements to appear.
-        page.wait_for_timeout(7_000)
+        # Allow dynamic content to load.
+        page.wait_for_timeout(7000)
 
-        # Scroll down so lazy-loaded listings are triggered.
-        for _ in range(5):
+        # Trigger lazy-loaded listings.
+        for _ in range(8):
             page.mouse.wheel(0, 1500)
-            page.wait_for_timeout(700)
+            page.wait_for_timeout(500)
 
-        listings = extract_listings(page)
+        current = extract_listings(page)
 
         browser.close()
 
     print(
-        f"Found {len(listings)} individual listings."
+        f"Found {len(current)} listings."
     )
 
-    if not listings:
+    if not current:
         raise RuntimeError(
-            "No Immobilien listings were detected. "
-            "RNZ may have changed its page structure or "
-            "the page may have returned a bot/challenge page. "
-            "The previous state was NOT overwritten."
+            "No listings detected. "
+            "The state and feed were NOT changed."
         )
 
-    new_ids = set(listings) - set(previous)
-
-    print(
-        f"New listings detected: {len(new_ids)}"
-    )
-
-    # First successful run establishes the baseline.
+    # First successful run:
+    # establish baseline.
     if not previous:
         print(
-            "No previous database found. "
-            "Creating initial baseline without notifications."
+            "Creating initial baseline."
         )
 
-        save_listings(listings)
-
-        with open(
-            os.environ["GITHUB_OUTPUT"],
-            "a",
-            encoding="utf-8",
-        ) as output:
-            output.write("new_count=0\n")
-            output.write("baseline=true\n")
+        save_state(current)
+        generate_feed(current)
 
         return
 
-    # Save the complete current database.
-    save_listings(listings)
+    # Preserve first_seen for existing listings.
+    for item_id, listing in current.items():
+        if item_id in previous:
+            listing["first_seen"] = previous[
+                item_id
+            ].get(
+                "first_seen",
+                listing["first_seen"],
+            )
 
-    # Prepare GitHub Actions output.
-    with open(
-        os.environ["GITHUB_OUTPUT"],
-        "a",
-        encoding="utf-8",
-    ) as output:
-        output.write(
-            f"new_count={len(new_ids)}\n"
-        )
-        output.write("baseline=false\n")
+    new_ids = (
+        set(current.keys())
+        - set(previous.keys())
+    )
 
-    if not new_ids:
-        print("No new advertisements.")
-        return
-
-    print("\nNEW LISTINGS:")
+    print(
+        f"New listings: {len(new_ids)}"
+    )
 
     for item_id in new_ids:
-        listing = listings[item_id]
-
         print(
-            f"\n{listing['title']}"
-            f"\n{listing['url']}"
-            f"\n{listing['text'][:1000]}"
+            "NEW:",
+            current[item_id]["rss_title"],
         )
+        print(
+            current[item_id]["url"]
+        )
+
+    save_state(current)
+    generate_feed(current)
+
+    print(
+        f"RSS feed generated: {FEED_FILE}"
+    )
 
 
 if __name__ == "__main__":
