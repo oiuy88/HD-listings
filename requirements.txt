@@ -1,1 +1,4 @@
 playwright==1.55.0
+pytesseract==0.3.13
+Pillow==11.3.0
+requests==2.32.5
